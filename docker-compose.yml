@@ -1,0 +1,73 @@
+name: factory-agent-project
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: factory-agent-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_pass_123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-factory_agent}
+      MYSQL_USER: ${MYSQL_USER:-factory_agent}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-factory_agent_pass}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "8902:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: factory-agent-backend
+    restart: unless-stopped
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-factory_agent}
+      MYSQL_USER: ${MYSQL_USER:-factory_agent}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-factory_agent_pass}
+      UPLOAD_DIR: /app/data/uploads
+      FRONTEND_BASE_URL: http://127.0.0.1:8900
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      DASHSCOPE_MODEL: ${DASHSCOPE_MODEL:-qwen-turbo}
+      DASHSCOPE_VL_MODEL: ${DASHSCOPE_VL_MODEL:-qwen-vl-plus}
+      KDNIAO_EBUSINESS_ID: ${KDNIAO_EBUSINESS_ID:-}
+      KDNIAO_API_KEY: ${KDNIAO_API_KEY:-}
+      KDNIAO_REQUEST_TYPE: ${KDNIAO_REQUEST_TYPE:-8002}
+      AMAP_KEY: ${AMAP_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      JIEJIARI_API_KEY: ${JIEJIARI_API_KEY:-}
+      DEFAULT_FACTORY_ADDRESS: ${DEFAULT_FACTORY_ADDRESS:-深圳}
+    volumes:
+      - backend_data:/app/data
+    ports:
+      - "8901:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: factory-agent-frontend
+    restart: unless-stopped
+    ports:
+      - "8900:80"
+    depends_on:
+      - backend
+
+volumes:
+  backend_data:
+  mysql_data:

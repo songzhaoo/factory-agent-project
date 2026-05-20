@@ -1,0 +1,11 @@
+.env
+docs/
+backend/data/
+__pycache__/
+*.pyc
+frontend/node_modules/
+frontend/dist/
+frontend/.npm-cache/
+.tmp-vue/
+.codex/
+~$*.docx
