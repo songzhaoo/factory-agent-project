@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 
 from app.schemas import (
     AgentAskRequest,
     AgentAskResponse,
     ImportResult,
+    InventoryMovement,
     MultimodalRecord,
     TaskDetail,
     WorkReportResponse,
@@ -27,8 +28,8 @@ def create_api_router(data_service: FactoryDataService, agent_service: FactoryAg
         return data_service.dashboard().model_dump()
 
     @router.get("/orders")
-    def orders() -> list[dict]:
-        return [item.model_dump() for item in data_service.list_orders()]
+    def orders(limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0)) -> list[dict]:
+        return [item.model_dump() for item in data_service.list_orders(limit=limit, offset=offset)]
 
     @router.get("/molds")
     def molds() -> list[dict]:
@@ -39,8 +40,8 @@ def create_api_router(data_service: FactoryDataService, agent_service: FactoryAg
         return [item.model_dump() for item in data_service.list_equipment()]
 
     @router.get("/tasks")
-    def tasks(order_id: str | None = None) -> list[dict]:
-        return [item.model_dump() for item in data_service.list_tasks(order_id)]
+    def tasks(order_id: str | None = None, limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0)) -> list[dict]:
+        return [item.model_dump() for item in data_service.list_tasks(order_id, limit=limit, offset=offset)]
 
     @router.get("/injection-runs")
     def injection_runs() -> list[dict]:
@@ -51,8 +52,12 @@ def create_api_router(data_service: FactoryDataService, agent_service: FactoryAg
         return [item.model_dump() for item in data_service.list_quality_issues()]
 
     @router.get("/inventory")
-    def inventory() -> list[dict]:
-        return [item.model_dump() for item in data_service.list_inventory()]
+    def inventory(limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0)) -> list[dict]:
+        return [item.model_dump() for item in data_service.list_inventory(limit=limit, offset=offset)]
+
+    @router.get("/inventory-movements", response_model=list[InventoryMovement])
+    def inventory_movements(material_name: str | None = None, limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0)) -> list[InventoryMovement]:
+        return data_service.list_inventory_movements(material_name=material_name, limit=limit, offset=offset)
 
     @router.get("/multimodal-records")
     def multimodal_records() -> list[dict]:
@@ -67,7 +72,10 @@ def create_api_router(data_service: FactoryDataService, agent_service: FactoryAg
 
     @router.post("/tasks/{task_id}/reports", response_model=WorkReportResponse)
     def submit_report(task_id: str, payload: WorkReportSubmit) -> WorkReportResponse:
-        result = data_service.submit_report(task_id, payload)
+        try:
+            result = data_service.submit_report(task_id, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if result is None:
             raise HTTPException(status_code=404, detail="没有找到该生产任务")
         return result
@@ -77,7 +85,10 @@ def create_api_router(data_service: FactoryDataService, agent_service: FactoryAg
         if data_type not in {"orders", "tasks", "inventory", "quality"}:
             raise HTTPException(status_code=400, detail="导入类型只能是 orders、tasks、inventory、quality")
         content = await file.read()
-        return data_service.import_table(data_type, file.filename or "upload.xlsx", content)
+        try:
+            return data_service.import_table(data_type, file.filename or "upload.xlsx", content)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/multimodal/upload", response_model=MultimodalRecord)
     async def upload_multimodal(

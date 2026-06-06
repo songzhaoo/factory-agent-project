@@ -12,3 +12,10 @@ docker compose up -d --build
 - MySQL 数据通过 `mysql_data` Docker volume 持久化。
 - 后端上传图片通过 `backend_data` Docker volume 持久化。
 - Nginx 前端容器负责静态资源托管和 `/api` 反向代理。
+- 数据库结构通过 `backend/migrations` 下的版本化 SQL 文件迁移，执行记录保存在 `schema_migrations` 表。
+
+手动执行数据库迁移：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/migrate.ps1
+```

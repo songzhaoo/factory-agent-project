@@ -30,6 +30,7 @@ from app.schemas import (
     ImportResult,
     InjectionRun,
     InventoryItem,
+    InventoryMovement,
     Mold,
     MultimodalRecord,
     Order,
@@ -67,6 +68,32 @@ PROCESS_KEYWORDS = [
     "包装出货",
 ]
 
+TASK_STATUS_NOT_STARTED = "未开始"
+TASK_STATUS_RUNNING = "加工中"
+TASK_STATUS_DONE = "已完成"
+TASK_STATUS_PAUSED = "异常暂停"
+
+ACTION_TO_STATUS = {
+    "开始加工": TASK_STATUS_RUNNING,
+    "加工完成": TASK_STATUS_DONE,
+    "异常暂停": TASK_STATUS_PAUSED,
+}
+
+ALLOWED_ACTIONS_BY_STATUS = {
+    TASK_STATUS_NOT_STARTED: {"开始加工"},
+    TASK_STATUS_PAUSED: {"开始加工"},
+    TASK_STATUS_RUNNING: {"加工完成", "异常暂停"},
+}
+
+EQUIPMENT_STATUS_BY_ACTION = {
+    "开始加工": "运行中",
+    "加工完成": "空闲",
+    "异常暂停": "故障/暂停",
+}
+
+MAX_IMPORT_FILE_BYTES = 10 * 1024 * 1024
+MAX_AGENT_ROWS = 30
+
 SHIPPER_CODES = {
     "顺丰": "SF",
     "中通": "ZTO",
@@ -88,7 +115,15 @@ PROVINCE_NAMES = {
 
 
 def rows_to_models(rows: list[dict[str, Any]], model: type) -> list:
-    return [model(**dict(row)) for row in rows]
+    return [model(**normalize_row_values(row)) for row in rows]
+
+
+def normalize_row_values(row: dict[str, Any]) -> dict[str, Any]:
+    data = dict(row)
+    for key, value in list(data.items()):
+        if isinstance(value, datetime):
+            data[key] = value.strftime("%Y-%m-%d %H:%M:%S")
+    return data
 
 
 class FactoryDataService:
@@ -102,10 +137,11 @@ class FactoryDataService:
         with self.database.connect() as conn:
             order_count = conn.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"]
             task_count = conn.execute("SELECT COUNT(*) c FROM production_tasks").fetchone()["c"]
-            running_task_count = conn.execute("SELECT COUNT(*) c FROM production_tasks WHERE current_status = '加工中'").fetchone()["c"]
+            running_task_count = conn.execute("SELECT COUNT(*) c FROM production_tasks WHERE current_status = ?", (TASK_STATUS_RUNNING,)).fetchone()["c"]
             exception_count = conn.execute("SELECT COUNT(*) c FROM quality_issues WHERE status != '已关闭'").fetchone()["c"]
             low_inventory_count = conn.execute("SELECT COUNT(*) c FROM inventory_items WHERE qty < safety_qty").fetchone()["c"]
-            overdue_risk_count = conn.execute("SELECT COUNT(*) c FROM production_tasks WHERE current_status != '已完成' AND planned_end_at < ?", (now_text(),)).fetchone()["c"]
+            candidate_tasks = conn.execute("SELECT planned_end_at FROM production_tasks WHERE current_status != ?", (TASK_STATUS_DONE,)).fetchall()
+            overdue_risk_count = sum(1 for task in candidate_tasks if FactoryAgentService._is_before(task.get("planned_end_at"), now_text()))
         return DashboardSummary(
             order_count=order_count,
             task_count=task_count,
@@ -115,9 +151,10 @@ class FactoryDataService:
             overdue_risk_count=overdue_risk_count,
         )
 
-    def list_orders(self) -> list[Order]:
+    def list_orders(self, limit: int = 100, offset: int = 0) -> list[Order]:
+        limit, offset = self._normalize_paging(limit, offset)
         with self.database.connect() as conn:
-            rows = conn.execute("SELECT * FROM orders ORDER BY updated_at DESC").fetchall()
+            rows = conn.execute("SELECT * FROM orders ORDER BY updated_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
         return [self._to_order(row) for row in rows]
 
     def list_molds(self) -> list[Mold]:
@@ -126,15 +163,16 @@ class FactoryDataService:
     def list_equipment(self) -> list[Equipment]:
         return self._list("equipment", Equipment)
 
-    def list_tasks(self, order_id: str | None = None) -> list[ProductionTask]:
+    def list_tasks(self, order_id: str | None = None, limit: int = 200, offset: int = 0) -> list[ProductionTask]:
+        limit, offset = self._normalize_paging(limit, offset)
         with self.database.connect() as conn:
             if order_id:
                 rows = conn.execute(
-                    "SELECT * FROM production_tasks WHERE order_id = ? ORDER BY process_seq, updated_at DESC",
-                    (order_id,),
+                    "SELECT * FROM production_tasks WHERE order_id = ? ORDER BY process_seq, updated_at DESC LIMIT ? OFFSET ?",
+                    (order_id, limit, offset),
                 ).fetchall()
             else:
-                rows = conn.execute("SELECT * FROM production_tasks ORDER BY process_seq, updated_at DESC").fetchall()
+                rows = conn.execute("SELECT * FROM production_tasks ORDER BY process_seq, updated_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
         return [self._to_task(row) for row in rows]
 
     def list_injection_runs(self) -> list[InjectionRun]:
@@ -143,8 +181,20 @@ class FactoryDataService:
     def list_quality_issues(self) -> list[QualityIssue]:
         return self._list("quality_issues", QualityIssue)
 
-    def list_inventory(self) -> list[InventoryItem]:
-        return self._list("inventory_items", InventoryItem)
+    def list_inventory(self, limit: int = 200, offset: int = 0) -> list[InventoryItem]:
+        return self._list("inventory_items", InventoryItem, limit=limit, offset=offset)
+
+    def list_inventory_movements(self, material_name: str | None = None, limit: int = 100, offset: int = 0) -> list[InventoryMovement]:
+        limit, offset = self._normalize_paging(limit, offset)
+        with self.database.connect() as conn:
+            if material_name:
+                rows = conn.execute(
+                    "SELECT * FROM inventory_movements WHERE material_name = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (material_name, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM inventory_movements ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+        return rows_to_models([self._normalize_db_row(row) for row in rows], InventoryMovement)
 
     def list_multimodal_records(self) -> list[MultimodalRecord]:
         with self.database.connect() as conn:
@@ -206,17 +256,14 @@ class FactoryDataService:
         return TaskDetail(task=self._to_task(task), reports=rows_to_models(reports, WorkReportRecord))
 
     def submit_report(self, task_id: str, payload: WorkReportSubmit) -> WorkReportResponse | None:
-        status_after = {
-            "开始加工": "加工中",
-            "加工完成": "已完成",
-            "异常暂停": "异常暂停",
-        }[payload.action]
+        status_after = ACTION_TO_STATUS[payload.action]
         now = now_text()
         with self.database.connect() as conn:
             task = conn.execute("SELECT * FROM production_tasks WHERE id = ?", (task_id,)).fetchone()
             if task is None:
                 logger.warning("work_report_task_not_found task_id=%s action=%s operator=%s", task_id, payload.action, payload.operator_name)
                 return None
+            self._validate_work_report(conn, task, payload.action)
             actual_start_at = task["actual_start_at"]
             actual_finish_at = task["actual_finish_at"]
             if payload.action == "开始加工" and not actual_start_at:
@@ -231,7 +278,10 @@ class FactoryDataService:
                 """,
                 (status_after, actual_start_at, actual_finish_at, payload.remark, now, task_id),
             )
-            conn.execute("UPDATE equipment SET status = ?, operator_name = ?, updated_at = ? WHERE code = ?", (status_after, payload.operator_name, now, task["equipment_code"]))
+            conn.execute(
+                "UPDATE equipment SET status = ?, operator_name = ?, updated_at = ? WHERE code = ?",
+                (EQUIPMENT_STATUS_BY_ACTION[payload.action], payload.operator_name if payload.action != "加工完成" else "", now, task["equipment_code"]),
+            )
             if task["mold_id"]:
                 conn.execute("UPDATE molds SET current_stage = ?, status = ?, owner_name = ?, updated_at = ? WHERE id = ?", (task["process_name"], status_after, payload.operator_name, now, task["mold_id"]))
             report_id = uuid.uuid4().hex
@@ -239,6 +289,7 @@ class FactoryDataService:
                 "INSERT INTO work_reports VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (report_id, task_id, payload.action, status_after, payload.operator_name, payload.remark, now),
             )
+            self._refresh_order_progress(conn, task.get("order_id"), now)
             updated_task = conn.execute("SELECT * FROM production_tasks WHERE id = ?", (task_id,)).fetchone()
             report = conn.execute("SELECT * FROM work_reports WHERE id = ?", (report_id,)).fetchone()
         logger.info(
@@ -252,12 +303,68 @@ class FactoryDataService:
         return WorkReportResponse(
             message=f"已提交：{payload.action}",
             task=self._to_task(updated_task),
-            report=WorkReportRecord(**dict(report)),
+            report=WorkReportRecord(**self._normalize_db_row(report)),
         )
 
+    def _validate_work_report(self, conn: Any, task: dict[str, Any], action: str) -> None:
+        current_status = str(task["current_status"])
+        allowed_actions = ALLOWED_ACTIONS_BY_STATUS.get(current_status, set())
+        if action not in allowed_actions:
+            raise ValueError(f"当前任务状态为“{current_status}”，不能提交“{action}”。")
+        if action == "开始加工":
+            blocking = self._find_previous_unfinished_task(conn, task)
+            if blocking:
+                raise ValueError(f"上一道工序“{blocking['process_name']}”尚未完成，不能开始当前工序。")
+            occupied = conn.execute(
+                """
+                SELECT id, product_name, process_name
+                FROM production_tasks
+                WHERE equipment_code = ? AND current_status = ? AND id != ?
+                LIMIT 1
+                """,
+                (task["equipment_code"], TASK_STATUS_RUNNING, task["id"]),
+            ).fetchone()
+            if occupied:
+                raise ValueError(f"设备 {task['equipment_code']} 正在加工任务 {occupied['id']}（{occupied['process_name']}），不能重复占用。")
+
+    @staticmethod
+    def _find_previous_unfinished_task(conn: Any, task: dict[str, Any]) -> dict[str, Any] | None:
+        if not task.get("order_id"):
+            return None
+        return conn.execute(
+            """
+            SELECT id, process_name, current_status
+            FROM production_tasks
+            WHERE order_id = ? AND process_seq < ? AND current_status != ?
+            ORDER BY process_seq DESC
+            LIMIT 1
+            """,
+            (task["order_id"], task["process_seq"], TASK_STATUS_DONE),
+        ).fetchone()
+
+    @staticmethod
+    def _refresh_order_progress(conn: Any, order_id: str | None, now: str) -> None:
+        if not order_id:
+            return
+        rows = conn.execute("SELECT current_status FROM production_tasks WHERE order_id = ?", (order_id,)).fetchall()
+        if not rows:
+            return
+        statuses = {row["current_status"] for row in rows}
+        if statuses == {TASK_STATUS_DONE}:
+            order_status = "已完成"
+        elif TASK_STATUS_PAUSED in statuses:
+            order_status = "异常暂停"
+        elif TASK_STATUS_RUNNING in statuses or TASK_STATUS_DONE in statuses:
+            order_status = "生产中"
+        else:
+            order_status = "未开始"
+        conn.execute("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?", (order_status, now, order_id))
+
     def import_table(self, data_type: str, filename: str, content: bytes) -> ImportResult:
+        self._validate_import_file(filename, content)
         logger.info("import_started data_type=%s filename=%s size_bytes=%s", data_type, filename, len(content))
         rows = self._read_rows(filename, content)
+        self._validate_import_rows(data_type, rows)
         errors: list[str] = []
         success = 0
         with self.database.connect() as conn:
@@ -293,24 +400,61 @@ class FactoryDataService:
         )
         return ImportResult(batch_id=batch_id, data_type=data_type, total_rows=len(rows), success_rows=success, error_rows=len(errors), errors=errors[:20])
 
-    def _list(self, table: str, model: type) -> list:
+    @staticmethod
+    def _validate_import_file(filename: str, content: bytes) -> None:
+        if not content:
+            raise ValueError("导入文件不能为空")
+        if len(content) > MAX_IMPORT_FILE_BYTES:
+            raise ValueError("导入文件不能超过 10MB")
+        if not filename.lower().endswith((".csv", ".xlsx")):
+            raise ValueError("导入文件仅支持 .csv 或 .xlsx")
+
+    @staticmethod
+    def _validate_import_rows(data_type: str, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            raise ValueError("导入文件没有数据行")
+        if len(rows) > 5000:
+            raise ValueError("单次导入最多支持 5000 行，请拆分文件")
+        required_columns = {
+            "orders": {"订单编号", "order_no"},
+            "tasks": {"工序", "process_name"},
+            "inventory": {"材料名称", "material_name"},
+            "quality": {"产品", "产品名称", "product_name"},
+        }[data_type]
+        headers = set().union(*(row.keys() for row in rows))
+        if not headers.intersection(required_columns):
+            raise ValueError(f"导入 {data_type} 缺少必要列：{' 或 '.join(sorted(required_columns))}")
+
+    def _list(self, table: str, model: type, limit: int = 200, offset: int = 0) -> list:
+        limit, offset = self._normalize_paging(limit, offset)
         with self.database.connect() as conn:
-            rows = conn.execute(f"SELECT * FROM {table} ORDER BY updated_at DESC" if table != "equipment" else f"SELECT * FROM {table} ORDER BY code").fetchall()
-        return rows_to_models(rows, model)
+            rows = conn.execute(
+                f"SELECT * FROM {table} ORDER BY updated_at DESC LIMIT ? OFFSET ?" if table != "equipment" else f"SELECT * FROM {table} ORDER BY code LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return rows_to_models([self._normalize_db_row(row) for row in rows], model)
+
+    @staticmethod
+    def _normalize_paging(limit: int, offset: int) -> tuple[int, int]:
+        return min(max(int(limit), 1), 1000), max(int(offset), 0)
+
+    @staticmethod
+    def _normalize_db_row(row: dict[str, Any]) -> dict[str, Any]:
+        return normalize_row_values(row)
 
     @staticmethod
     def _to_multimodal_record(row: dict[str, Any]) -> MultimodalRecord:
-        data = dict(row)
+        data = FactoryDataService._normalize_db_row(row)
         data["extracted"] = json.loads(data.pop("extracted_json") or "{}")
         return MultimodalRecord(**data)
 
     def _to_task(self, row: dict[str, Any]) -> ProductionTask:
-        task = ProductionTask(**dict(row))
+        task = ProductionTask(**self._normalize_db_row(row))
         task.report_url = f"{self.frontend_base_url}/work-report?task_id={task.id}"
         return task
 
     def _to_order(self, row: dict[str, Any]) -> Order:
-        order = Order(**dict(row))
+        order = Order(**self._normalize_db_row(row))
         order.report_url = f"{self.frontend_base_url}/work-report?order_id={order.id}"
         return order
 
@@ -342,12 +486,15 @@ class FactoryDataService:
         order_no = str(self._value(row, "订单编号", "order_no"))
         if not order_no:
             raise ValueError("订单编号不能为空")
+        quantity = int(self._value(row, "数量", "quantity", default=0))
+        if quantity < 0:
+            raise ValueError("数量不能为负数")
         values = (
             f"ORD-{order_no}",
             order_no,
             str(self._value(row, "产品名称", "product_name")),
             str(self._value(row, "产品类型", "product_type", default="塑胶件")),
-            int(self._value(row, "数量", "quantity", default=0)),
+            quantity,
             str(self._value(row, "交期", "due_date", default=now)),
             str(self._value(row, "状态", "status", default="未开始")),
             str(self._value(row, "优先级", "priority", default="普通")),
@@ -367,13 +514,27 @@ class FactoryDataService:
     def _upsert_task(self, conn: Any, row: dict[str, Any]) -> None:
         now = now_text()
         task_id = str(self._value(row, "任务编号", "id", default=uuid.uuid4().hex[:8]))
+        status = str(self._value(row, "状态", "current_status", default=TASK_STATUS_NOT_STARTED))
+        if status not in {TASK_STATUS_NOT_STARTED, TASK_STATUS_RUNNING, TASK_STATUS_DONE, TASK_STATUS_PAUSED}:
+            raise ValueError(f"不支持的工序状态：{status}")
+        process_name = str(self._value(row, "工序", "process_name"))
+        if not process_name:
+            raise ValueError("工序不能为空")
+        order_no = str(self._value(row, "订单编号", "order_no", default=""))
+        order_id = None
+        if order_no:
+            order = conn.execute("SELECT id FROM orders WHERE order_no = ?", (order_no,)).fetchone()
+            if not order:
+                raise ValueError(f"订单编号不存在：{order_no}")
+            order_id = order["id"]
         values = (
             task_id,
+            order_id,
             str(self._value(row, "产品", "产品名称", "product_name")),
-            str(self._value(row, "工序", "process_name")),
+            process_name,
             int(self._value(row, "工序顺序", "process_seq", default=99)),
             str(self._value(row, "设备", "equipment_code")),
-            str(self._value(row, "状态", "current_status", default="未开始")),
+            status,
             str(self._value(row, "负责人", "owner_name", default="待分配")),
             str(self._value(row, "计划开始", "planned_start_at", default="")),
             str(self._value(row, "计划结束", "planned_end_at", default="")),
@@ -384,10 +545,10 @@ class FactoryDataService:
         conn.execute(
             """
             INSERT INTO production_tasks
-            (id, product_name, process_name, process_seq, equipment_code, current_status, owner_name, planned_start_at, planned_end_at, remark, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, order_id, product_name, process_name, process_seq, equipment_code, current_status, owner_name, planned_start_at, planned_end_at, remark, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE product_name=VALUES(product_name), process_name=VALUES(process_name),
-            process_seq=VALUES(process_seq), equipment_code=VALUES(equipment_code), current_status=VALUES(current_status),
+            order_id=VALUES(order_id), process_seq=VALUES(process_seq), equipment_code=VALUES(equipment_code), current_status=VALUES(current_status),
             owner_name=VALUES(owner_name), planned_start_at=VALUES(planned_start_at), planned_end_at=VALUES(planned_end_at),
             remark=VALUES(remark), updated_at=VALUES(updated_at)
             """,
@@ -399,26 +560,76 @@ class FactoryDataService:
         material = str(self._value(row, "材料名称", "material_name"))
         if not material:
             raise ValueError("材料名称不能为空")
-        conn.execute(
-            """
-            INSERT INTO inventory_items (id, material_name, spec, unit, qty, safety_qty, supplier, eta, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                uuid.uuid4().hex,
-                material,
-                str(self._value(row, "规格", "spec", default="")),
-                str(self._value(row, "单位", "unit", default="kg")),
-                float(self._value(row, "库存", "qty", default=0)),
-                float(self._value(row, "安全库存", "safety_qty", default=0)),
-                str(self._value(row, "供应商", "supplier", default="")),
-                str(self._value(row, "预计到货", "eta", default="")),
-                now,
-            ),
+        spec = str(self._value(row, "规格", "spec", default=""))
+        qty = float(self._value(row, "库存", "qty", default=0))
+        safety_qty = float(self._value(row, "安全库存", "safety_qty", default=0))
+        if qty < 0 or safety_qty < 0:
+            raise ValueError("库存和安全库存不能为负数")
+        existing = conn.execute("SELECT * FROM inventory_items WHERE material_name = ? AND IFNULL(spec, '') = ? ORDER BY updated_at DESC LIMIT 1", (material, spec)).fetchone()
+        if existing:
+            inventory_id = existing["id"]
+            old_qty = float(existing["qty"])
+            conn.execute(
+                """
+                UPDATE inventory_items
+                SET unit = ?, qty = ?, safety_qty = ?, supplier = ?, eta = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(self._value(row, "单位", "unit", default=existing.get("unit") or "kg")),
+                    qty,
+                    safety_qty,
+                    str(self._value(row, "供应商", "supplier", default=existing.get("supplier") or "")),
+                    str(self._value(row, "预计到货", "eta", default=existing.get("eta") or "")),
+                    now,
+                    inventory_id,
+                ),
+            )
+        else:
+            inventory_id = uuid.uuid4().hex
+            old_qty = 0.0
+            conn.execute(
+                """
+                INSERT INTO inventory_items (id, material_name, spec, unit, qty, safety_qty, supplier, eta, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    inventory_id,
+                    material,
+                    spec,
+                    str(self._value(row, "单位", "unit", default="kg")),
+                    qty,
+                    safety_qty,
+                    str(self._value(row, "供应商", "supplier", default="")),
+                    str(self._value(row, "预计到货", "eta", default="")),
+                    now,
+                ),
+            )
+        self._record_inventory_movement(
+            conn,
+            inventory_id=inventory_id,
+            material_name=material,
+            movement_type="导入调整",
+            qty_delta=qty - old_qty,
+            qty_after=qty,
+            reference_type="import",
+            reference_id=None,
+            operator_name="系统导入",
+            remark=str(self._value(row, "备注", "remark", default="")),
+            created_at=now,
         )
 
     def _upsert_quality(self, conn: Any, row: dict[str, Any]) -> None:
         now = now_text()
+        product_name = str(self._value(row, "产品", "产品名称", "product_name"))
+        issue_type = str(self._value(row, "异常类型", "issue_type"))
+        if not product_name:
+            raise ValueError("产品不能为空")
+        if not issue_type:
+            raise ValueError("异常类型不能为空")
+        bad_qty = int(self._value(row, "不良数量", "bad_qty", default=0))
+        if bad_qty < 0:
+            raise ValueError("不良数量不能为负数")
         conn.execute(
             """
             INSERT INTO quality_issues
@@ -427,15 +638,38 @@ class FactoryDataService:
             """,
             (
                 uuid.uuid4().hex,
-                str(self._value(row, "产品", "产品名称", "product_name")),
-                str(self._value(row, "异常类型", "issue_type")),
-                int(self._value(row, "不良数量", "bad_qty", default=0)),
+                product_name,
+                issue_type,
+                bad_qty,
                 str(self._value(row, "原因", "cause", default="")),
                 str(self._value(row, "状态", "status", default="处理中")),
                 str(self._value(row, "负责人", "owner_name", default="")),
                 now,
                 now,
             ),
+        )
+
+    @staticmethod
+    def _record_inventory_movement(
+        conn: Any,
+        inventory_id: str,
+        material_name: str,
+        movement_type: str,
+        qty_delta: float,
+        qty_after: float,
+        reference_type: str | None,
+        reference_id: str | None,
+        operator_name: str | None,
+        remark: str | None,
+        created_at: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO inventory_movements
+            (id, inventory_id, material_name, movement_type, qty_delta, qty_after, reference_type, reference_id, operator_name, remark, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (uuid.uuid4().hex, inventory_id, material_name, movement_type, qty_delta, qty_after, reference_type, reference_id, operator_name, remark, created_at),
         )
 
     @staticmethod
@@ -661,7 +895,8 @@ class FactoryAgentService:
 
     def query_order_progress(self, args: dict[str, Any]) -> list[dict[str, Any]]:
         rows = [item.model_dump() for item in self.data_service.list_orders()] + [item.model_dump() for item in self.data_service.list_molds()]
-        return self._filter_by_context(rows, args)
+        rows = self._filter_by_context(rows, args)
+        return self._cap_agent_rows(rows, args, "请补充订单号、产品名或模具编号后再查询订单进度。")
 
     def query_process_tasks(self, args: dict[str, Any]) -> list[dict[str, Any]]:
         q = str(args.get("raw_question") or args.get("question") or "").upper()
@@ -671,34 +906,44 @@ class FactoryAgentService:
         if hits:
             rows = [row for row in rows if any(key.upper() in f"{row['process_name']} {row['equipment_code']} {row['product_name']}".upper() for key in hits)]
         rows = self._filter_by_context(rows, args)
-        return rows
+        return self._cap_agent_rows(rows, args, "请补充订单号、产品名、工序名或设备编号后再查询工序进度。")
 
     def query_equipment_schedule(self, args: dict[str, Any]) -> list[dict[str, Any]]:
         return self.query_process_tasks(args)
 
     def query_injection_runs(self, args: dict[str, Any]) -> list[dict[str, Any]]:
-        return self._filter_by_context([item.model_dump() for item in self.data_service.list_injection_runs()], args)
+        rows = self._filter_by_context([item.model_dump() for item in self.data_service.list_injection_runs()], args)
+        return self._cap_agent_rows(rows, args, "请补充产品名、订单号或注塑机编号后再查询注塑进度。")
 
     def query_quality_issues(self, args: dict[str, Any]) -> list[dict[str, Any]]:
-        return self._filter_by_context([item.model_dump() for item in self.data_service.list_quality_issues()], args)
+        rows = self._filter_by_context([item.model_dump() for item in self.data_service.list_quality_issues()], args)
+        return self._cap_agent_rows(rows, args, "请补充产品名、异常类型或订单号后再查询质检异常。")
 
-    def query_inventory(self, _: dict[str, Any]) -> list[dict[str, Any]]:
-        return [item.model_dump() for item in self.data_service.list_inventory()]
+    def query_inventory(self, args: dict[str, Any]) -> list[dict[str, Any]]:
+        q = str(args.get("raw_question") or args.get("question") or "").upper()
+        rows = [item.model_dump() for item in self.data_service.list_inventory(limit=1000)]
+        materials = ["ABS", "PP", "P20", "PC", "PA", "POM", "模具钢"]
+        hits = [key for key in materials if key in q]
+        if "低库存" in q or "安全库存" in q or "预警" in q or "不够" in q:
+            rows = [row for row in rows if float(row["qty"]) < float(row["safety_qty"])]
+        elif hits:
+            rows = [row for row in rows if any(key in f"{row['material_name']} {row.get('spec') or ''}".upper() for key in hits)]
+        return self._cap_agent_rows(rows, args, "请补充材料名称或说明要查低库存/安全库存。")
 
     def query_multimodal_records(self, args: dict[str, Any]) -> list[dict[str, Any]]:
         q = str(args.get("raw_question") or args.get("question") or "")
         rows = [item.model_dump() for item in self.data_service.list_multimodal_records()]
         if any(key in q for key in ["单据", "送货单", "采购单", "报工单"]):
-            return [row for row in rows if row["category"] == "document"] or rows
-        if any(key in q for key in ["缺陷", "图片", "质检", "缩水", "毛边", "划痕", "色差"]):
-            return [row for row in rows if row["category"] == "quality"] or rows
-        if any(key in q for key in ["设备", "报警", "面板", "铭牌"]):
-            return [row for row in rows if row["category"] == "equipment"] or rows
-        if any(key in q for key in ["库存", "标签", "盘点", "物料"]):
-            return [row for row in rows if row["category"] == "inventory"] or rows
-        if any(key in q for key in ["图纸", "工艺", "尺寸", "公差"]):
-            return [row for row in rows if row["category"] == "drawing"] or rows
-        return rows
+            rows = [row for row in rows if row["category"] == "document"] or rows
+        elif any(key in q for key in ["缺陷", "图片", "质检", "缩水", "毛边", "划痕", "色差"]):
+            rows = [row for row in rows if row["category"] == "quality"] or rows
+        elif any(key in q for key in ["设备", "报警", "面板", "铭牌"]):
+            rows = [row for row in rows if row["category"] == "equipment"] or rows
+        elif any(key in q for key in ["库存", "标签", "盘点", "物料"]):
+            rows = [row for row in rows if row["category"] == "inventory"] or rows
+        elif any(key in q for key in ["图纸", "工艺", "尺寸", "公差"]):
+            rows = [row for row in rows if row["category"] == "drawing"] or rows
+        return self._cap_agent_rows(rows, args, "请补充图片类型、文件名或关联业务后再查询多模态记录。")
 
     def query_weather(self, args: dict[str, Any]) -> list[dict[str, Any]]:
         question = str(args.get("question", ""))
@@ -887,11 +1132,11 @@ class FactoryAgentService:
     def generate_delay_risk_report(self, _: dict[str, Any]) -> list[dict[str, Any]]:
         now = now_text()
         risky = []
-        for task in self.data_service.list_tasks():
-            if task.current_status != "已完成" and (task.planned_end_at or "") < now:
+        for task in self.data_service.list_tasks(limit=1000):
+            if task.current_status != TASK_STATUS_DONE and self._is_before(task.planned_end_at, now):
                 risky.append(task.model_dump())
         if not risky:
-            risky = [task.model_dump() for task in self.data_service.list_tasks() if task.current_status != "已完成"][:5]
+            risky = [task.model_dump() for task in self.data_service.list_tasks(limit=1000) if task.current_status != TASK_STATUS_DONE][:5]
         return risky
 
     def _choose_tool_by_rules(self, question: str) -> str:
@@ -938,6 +1183,10 @@ class FactoryAgentService:
     def _format_answer(self, tool: str, data: list[dict[str, Any]]) -> str:
         if not data:
             return "没有查询到匹配数据。"
+        if data[0].get("needs_clarification"):
+            return str(data[0]["message"])
+        if data[0].get("notice"):
+            return str(data[0]["notice"])
         if tool == "query_inventory":
             lines = ["库存情况："]
             for row in data:
@@ -1034,6 +1283,20 @@ class FactoryAgentService:
                 (uuid.uuid4().hex, question, tool_name, json.dumps(arguments, ensure_ascii=False), now_text()),
             )
 
+    def _cap_agent_rows(self, rows: list[dict[str, Any]], args: dict[str, Any], clarification: str) -> list[dict[str, Any]]:
+        if len(rows) <= MAX_AGENT_ROWS:
+            return rows
+        question = str(args.get("raw_question") or args.get("question") or "")
+        if not self._find_subject(question) and not self._has_specific_filter(question):
+            return [{"needs_clarification": True, "message": f"匹配到 {len(rows)} 条数据，范围过大。{clarification}"}]
+        return rows[:MAX_AGENT_ROWS]
+
+    @staticmethod
+    def _has_specific_filter(question: str) -> bool:
+        if re.search(r"(SO\d{6,}|ORD[-_A-Za-z0-9]+|MOLD[-_A-Za-z0-9]+|MJ[-_A-Za-z0-9]+)", question, re.I):
+            return True
+        return any(key in question.upper() for key in ["CNC", "EDM", "WIRE", "INJ", "ABS", "PP", "P20"])
+
     def _filter_by_context(self, rows: list[dict[str, Any]], args: dict[str, Any]) -> list[dict[str, Any]]:
         question = str(args.get("question", ""))
         context = self._normalize_context(args.get("context") or {})
@@ -1062,6 +1325,27 @@ class FactoryAgentService:
 
         filtered = [row for row in rows if row_matches(row)]
         return filtered or rows
+
+    @staticmethod
+    def _is_before(left: str | None, right: str) -> bool:
+        if not left:
+            return False
+        left_dt = FactoryAgentService._parse_datetime(left)
+        right_dt = FactoryAgentService._parse_datetime(right)
+        if not left_dt or not right_dt:
+            return str(left) < str(right)
+        return left_dt < right_dt
+
+    @staticmethod
+    def _parse_datetime(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(str(value), fmt)
+            except ValueError:
+                continue
+        return None
 
     def _find_subject(self, question: str) -> dict[str, Any]:
         q = question.upper()

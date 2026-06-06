@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, Iterator
 
 try:
@@ -32,6 +35,14 @@ EQUIPMENT = [
 
 logger = logging.getLogger(__name__)
 
+MIGRATION_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    applied_at VARCHAR(32) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
 
 def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
@@ -43,6 +54,13 @@ def now_text() -> str:
 
 def dt_text(days: int = 0, hours: int = 0) -> str:
     return (datetime.now() + timedelta(days=days, hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def re_match_create_index(statement: str) -> tuple[str, str] | None:
+    match = re.match(r"CREATE\s+INDEX\s+([A-Za-z0-9_]+)\s+ON\s+([A-Za-z0-9_]+)\s*\(", statement, flags=re.I)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
 
 
 class MySQLConnectionAdapter:
@@ -67,17 +85,24 @@ class MySQLConnectionAdapter:
     def close(self) -> None:
         self.connection.close()
 
+    def ping(self) -> None:
+        self.connection.ping(reconnect=True)
+
 
 class Database:
-    def __init__(self) -> None:
+    def __init__(self, seed_demo: bool = True) -> None:
+        self.pool_size = max(1, int(os.getenv("MYSQL_POOL_SIZE", "5")))
+        self._pool: Queue[MySQLConnectionAdapter] = Queue(maxsize=self.pool_size)
         logger.info(
-            "database_initializing driver=mysql host=%s port=%s database=%s",
+            "database_initializing driver=mysql host=%s port=%s database=%s pool_size=%s",
             os.getenv("MYSQL_HOST", "mysql"),
             os.getenv("MYSQL_PORT", "3306"),
             os.getenv("MYSQL_DATABASE", "factory_agent"),
+            self.pool_size,
         )
         self.init_schema()
-        self.seed_demo_data()
+        if seed_demo:
+            self.seed_demo_data()
 
     @contextmanager
     def connect(self) -> Iterator[MySQLConnectionAdapter]:
@@ -89,11 +114,20 @@ class Database:
             connection.rollback()
             raise
         finally:
-            connection.close()
+            self._release(connection)
 
     def _connect(self) -> MySQLConnectionAdapter:
         if pymysql is None or DictCursor is None:
             raise RuntimeError("当前环境缺少 pymysql，无法连接 MySQL")
+        try:
+            pooled = self._pool.get_nowait()
+            pooled.ping()
+            return pooled
+        except Empty:
+            pass
+        except Exception:
+            logger.warning("pooled_mysql_connection_invalid")
+
         last_error: Exception | None = None
         for _ in range(30):
             try:
@@ -113,9 +147,70 @@ class Database:
                 time.sleep(1)
         raise RuntimeError(f"MySQL 连接失败：{last_error}") from last_error
 
+    def _release(self, connection: MySQLConnectionAdapter) -> None:
+        try:
+            connection.ping()
+            self._pool.put_nowait(connection)
+        except Exception:
+            try:
+                connection.close()
+            except Exception:
+                logger.debug("mysql_connection_close_failed", exc_info=True)
+
     def init_schema(self) -> None:
         with self.connect() as conn:
-            conn.executescript(MYSQL_SCHEMA)
+            self.apply_migrations(conn)
+
+    def apply_migrations(self, conn: MySQLConnectionAdapter) -> None:
+        conn.executescript(MIGRATION_TABLE_SQL)
+        applied = {
+            row["version"]
+            for row in conn.execute("SELECT version FROM schema_migrations").fetchall()
+        }
+        for migration in self._migration_files():
+            version, name = self._parse_migration_name(migration)
+            if version in applied:
+                continue
+            logger.info("migration_applying version=%s name=%s", version, name)
+            self._execute_migration_script(conn, migration.read_text(encoding="utf-8"))
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                (version, name, now_text()),
+            )
+            logger.info("migration_applied version=%s name=%s", version, name)
+
+    @staticmethod
+    def _migration_files() -> list[Path]:
+        default_dir = Path(__file__).resolve().parents[2] / "migrations"
+        migrations_dir = Path(os.getenv("DB_MIGRATIONS_DIR", str(default_dir)))
+        return sorted(migrations_dir.glob("*.sql"))
+
+    @staticmethod
+    def _parse_migration_name(path: Path) -> tuple[str, str]:
+        stem = path.stem
+        version, _, name = stem.partition("_")
+        if not version or not name:
+            raise RuntimeError(f"迁移文件命名不合法：{path.name}，应使用 001_description.sql")
+        return version, name
+
+    def _execute_migration_script(self, conn: MySQLConnectionAdapter, script: str) -> None:
+        for statement in [item.strip() for item in script.split(";") if item.strip()]:
+            if self._should_skip_existing_index(conn, statement):
+                continue
+            conn.execute(statement)
+
+    @staticmethod
+    def _should_skip_existing_index(conn: MySQLConnectionAdapter, statement: str) -> bool:
+        normalized = " ".join(statement.split())
+        match = re_match_create_index(normalized)
+        if not match:
+            return False
+        index_name, table_name = match
+        exists = conn.execute("SHOW INDEX FROM " + table_name + " WHERE Key_name = ?", (index_name,)).fetchone()
+        if exists:
+            logger.info("migration_index_skipped reason=exists table=%s index=%s", table_name, index_name)
+            return True
+        return False
 
     def seed_demo_data(self) -> None:
         with self.connect() as conn:
@@ -351,6 +446,21 @@ CREATE TABLE IF NOT EXISTS inventory_items (
     supplier VARCHAR(255),
     eta VARCHAR(32),
     updated_at VARCHAR(32) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS inventory_movements (
+    id VARCHAR(64) PRIMARY KEY,
+    inventory_id VARCHAR(64),
+    material_name VARCHAR(255) NOT NULL,
+    movement_type VARCHAR(64) NOT NULL,
+    qty_delta DOUBLE NOT NULL,
+    qty_after DOUBLE NOT NULL,
+    reference_type VARCHAR(64),
+    reference_id VARCHAR(64),
+    operator_name VARCHAR(100),
+    remark TEXT,
+    created_at VARCHAR(32) NOT NULL,
+    CONSTRAINT fk_inventory_movements_item FOREIGN KEY(inventory_id) REFERENCES inventory_items(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS multimodal_records (

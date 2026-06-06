@@ -136,6 +136,20 @@ class InventoryItem(BaseModel):
     updated_at: str
 
 
+class InventoryMovement(BaseModel):
+    id: str
+    inventory_id: str | None = None
+    material_name: str
+    movement_type: str
+    qty_delta: float
+    qty_after: float
+    reference_type: str | None = None
+    reference_id: str | None = None
+    operator_name: str | None = None
+    remark: str | None = None
+    created_at: str
+
+
 class MultimodalRecord(BaseModel):
     id: str
     category: str
